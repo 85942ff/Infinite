@@ -35,6 +35,14 @@ local DebrisService = game:GetService("Debris")
 
 local GunEvent = RepStorage:WaitForChild("Events"):WaitForChild("EventsReplication"):WaitForChild("CommunicateGun")
 
+local HitSounds = {
+    ["关闭"]     = nil,
+    ["默认"]     = "rbxassetid://9116483270",
+    ["Skeet"]     = "rbxassetid://5633695679",
+    ["Neverlose"] = "rbxassetid://8726881116",
+    ["Gamesense"] = "rbxassetid://4817809188",
+}
+
 getgenv().RageSettings = {
     MasterSwitch = false,
     Interval = 0.01,
@@ -42,19 +50,38 @@ getgenv().RageSettings = {
     Silent = true,
     IgnoreTeam = true,
     Prediction = 0.13,
-    WallCheck = true
+    WallCheck = true,
+    HitSound = "默认",
+    HitNotify = true,
+    Speed = 16
 }
 
 local RageSettings = getgenv().RageSettings
 local VelCache = {}
 local lastShot = 0
-local reloaded = false
 
-local function doReload()
-    pcall(function()
-        GunEvent:FireServer("Reload")
-        reloaded = true
-    end)
+local function getCurrentWeaponName()
+    local char = LocalPlayer.Character
+    if char then
+        local tool = char:FindFirstChildOfClass("Tool")
+        if tool then return tool.Name end
+    end
+    local backpack = LocalPlayer:FindFirstChild("Backpack")
+    if backpack then
+        for _, item in ipairs(backpack:GetChildren()) do
+            if item:IsA("Tool") then
+                return item.Name
+            end
+        end
+    end
+    return nil
+end
+
+local function isShotgun()
+    local name = getCurrentWeaponName()
+    if not name then return false end
+    local lower = name:lower()
+    return lower:find("shotgun") or lower:find("散弹") or lower:find("霰弹")
 end
 
 local function createTrail(origin, targetPos)
@@ -83,8 +110,10 @@ local function createTrail(origin, targetPos)
 end
 
 local function playFireSound()
+    local soundId = HitSounds[RageSettings.HitSound]
+    if not soundId then return end
     local snd = Instance.new("Sound")
-    snd.SoundId = "rbxassetid://9116483270"
+    snd.SoundId = soundId
     snd.Volume = 1
     snd.Parent = Workspace
     snd.PlayOnRemove = true
@@ -122,6 +151,7 @@ local function getClosestTarget()
         if not char then continue end
         local hum = char:FindFirstChild("Humanoid")
         if not hum or hum.Health <= 0 then continue end
+        if char:FindFirstChildOfClass("ForceField") then continue end
 
         if RageSettings.IgnoreTeam and plr.Team and LocalPlayer.Team and plr.Team == LocalPlayer.Team then
             continue
@@ -149,12 +179,37 @@ local function isWallBetween(origin, targetPos, ignoreList)
     return result ~= nil
 end
 
-local function doShot(plr, hitPos, hitPart)
-    if not reloaded then
-        doReload()
-        return
-    end
+local function fireSingleBullet(fireOrigin, dir, hitPos, bulletId, stackTrace, hitPart, hitStackTrace)
+    pcall(function()
+        GunEvent:FireServer("Fired", fireOrigin, dir, hitPos, {{bulletId, dir}}, stackTrace)
+        if hitPart then
+            GunEvent:FireServer("Hit", bulletId, hitPart, hitPos, hitStackTrace, {sz = hitPart.Size})
+        end
+    end)
+end
 
+local function fireShotgun(plr, fireOrigin, hitPos, hitPart, bulletCount)
+    local stackTrace = "ReplicatedStorage.Modules.Client.Behaviours.BehaviourGunClient:27\n"
+    local hitStackTrace = "ReplicatedStorage.Modules.Client.Behaviours.BehaviourGunClient.ProjectileEnvConstructors.Projectile:27\n"
+    for i = 1, bulletCount do
+        local bulletId = tostring(tick() + i * 0.001) .. "|" .. i
+        local spread = Vector3.new(
+            (math.random() - 0.5) * 0.1,
+            (math.random() - 0.5) * 0.1,
+            (math.random() - 0.5) * 0.1
+        )
+        local dir = ((hitPos + spread) - fireOrigin).Unit
+        local actualHit = hitPos + spread
+        pcall(function()
+            GunEvent:FireServer("Fired", fireOrigin, dir, actualHit, {{bulletId, dir}}, stackTrace)
+            if hitPart then
+                GunEvent:FireServer("Hit", bulletId, hitPart, actualHit, hitStackTrace, {sz = hitPart.Size})
+            end
+        end)
+    end
+end
+
+local function doShot(plr, hitPos, hitPart)
     local char = LocalPlayer.Character
     local root = char and char:FindFirstChild("HumanoidRootPart")
     if not root then return end
@@ -179,37 +234,46 @@ local function doShot(plr, hitPos, hitPart)
     local stackTrace = "ReplicatedStorage.Modules.Client.Behaviours.BehaviourGunClient:27\n"
     local hitStackTrace = "ReplicatedStorage.Modules.Client.Behaviours.BehaviourGunClient.ProjectileEnvConstructors.Projectile:27\n"
 
-    pcall(function()
-        GunEvent:FireServer("Fired",
-            fireOrigin,
-            dir,
-            hitPos,
-            {{bulletId, dir}},
-            stackTrace
-        )
+    if not hitPart then
+        hitPart = plr.Character and (plr.Character:FindFirstChild(RageSettings.TargetBone) or plr.Character:FindFirstChild("Head"))
+    end
 
-        if not hitPart then
-            hitPart = plr.Character and (plr.Character:FindFirstChild(RageSettings.TargetBone) or plr.Character:FindFirstChild("Head"))
+    local targetHum = plr.Character and plr.Character:FindFirstChildOfClass("Humanoid")
+    local prevHealth = targetHum and targetHum.Health or 0
+    local connection
+    if RageSettings.HitNotify and targetHum then
+        connection = targetHum.HealthChanged:Connect(function(newHealth)
+            if newHealth < prevHealth then
+                local dmg = math.floor(prevHealth - newHealth + 0.5)
+                local dist = math.floor((hitPos - root.Position).Magnitude + 0.5)
+                Library:Notify({
+                    Title = "命中提示",
+                    Description = "HIT " .. plr.Name .. " [" .. dist .. "m] -" .. dmg .. " HP",
+                    Time = 1
+                })
+                if connection then connection:Disconnect() end
+            end
+        end)
+        task.delay(0.5, function()
+            if connection then connection:Disconnect() end
+        end)
+    end
+
+    if isShotgun() then
+        fireShotgun(plr, fireOrigin, hitPos, hitPart, 8)
+        for i = 1, 3 do
+            local spread = Vector3.new((math.random()-0.5)*2, (math.random()-0.5)*2, (math.random()-0.5)*2)
+            createTrail(fireOrigin, hitPos + spread)
         end
-
-        if hitPart then
-            GunEvent:FireServer("Hit",
-                bulletId,
-                hitPart,
-                hitPos,
-                hitStackTrace,
-                {sz = hitPart.Size}
-            )
-        end
-
-        reloaded = false
-    end)
+    else
+        fireSingleBullet(fireOrigin, dir, hitPos, bulletId, stackTrace, hitPart, hitStackTrace)
+        createTrail(fireOrigin, hitPos)
+    end
 
     if oldCFrame then
         root.CFrame = oldCFrame
     end
 
-    createTrail(fireOrigin, hitPos)
     playFireSound()
 end
 
@@ -356,10 +420,7 @@ RunService.RenderStepped:Connect(function()
             local topY = topScreenPos.Y
             local bottomY = bottomScreenPos.Y
             local rootX = rootScreenPos.X
-
-            if topY > bottomY then
-                topY, bottomY = bottomY, topY
-            end
+            if topY > bottomY then topY, bottomY = bottomY, topY end
 
             local height = bottomY - topY
             local width = height * 0.5
@@ -370,13 +431,11 @@ RunService.RenderStepped:Connect(function()
                 esp.Box.Position = Vector2.new(rootX - width/2, topY)
                 esp.Box.Size = Vector2.new(width, height)
             end
-
             if esp.Name then
                 esp.Name.Visible = true
                 esp.Name.Text = plr.Name
                 esp.Name.Position = Vector2.new(rootX, topY - 15)
             end
-
             if esp.HealthBar and humanoid then
                 esp.HealthBar.Visible = true
                 local healthPercent = humanoid.Health / humanoid.MaxHealth
@@ -386,14 +445,12 @@ RunService.RenderStepped:Connect(function()
                 esp.HealthBar.To = Vector2.new(barX, barTop)
                 esp.HealthBar.Color = Color3.fromRGB(255 * (1 - healthPercent), 255 * healthPercent, 0)
             end
-
             if esp.Distance and localRoot then
                 esp.Distance.Visible = true
                 local dist = (root.Position - localRoot.Position).Magnitude
                 esp.Distance.Text = math.floor(dist) .. "m"
                 esp.Distance.Position = Vector2.new(rootX, bottomY + 5)
             end
-
             if esp.Tracer then
                 esp.Tracer.Visible = true
                 esp.Tracer.From = Vector2.new(screenSize.X / 2, screenSize.Y)
@@ -411,14 +468,14 @@ end)
 
 UpdateESP()
 
-local RagebotLeft = Tabs.Main:AddLeftGroupbox("Ragebot ")
+local RagebotLeft = Tabs.Main:AddLeftGroupbox("Ragebot")
 RagebotLeft:AddToggle("MasterSwitch", {
     Text = "启用 Ragebot",
     Default = false,
     Callback = function(val) RageSettings.MasterSwitch = val end
 })
 RagebotLeft:AddSlider("Interval", {
-    Text = "射击间隔 ",
+    Text = "射击间隔",
     Min = 0.001, Max = 1, Default = 0.01, Rounding = 3,
     Callback = function(v) RageSettings.Interval = v end
 })
@@ -448,100 +505,85 @@ RagebotLeft:AddToggle("WallCheck", {
     Default = true,
     Callback = function(v) RageSettings.WallCheck = v end
 })
+RagebotLeft:AddDropdown("HitSound", {
+    Text = "命中音效",
+    Values = {"关闭", "默认", "Skeet", "Neverlose", "Gamesense"},
+    Default = "默认",
+    Callback = function(v) RageSettings.HitSound = v end
+})
+RagebotLeft:AddToggle("HitNotify", {
+    Text = "命中提示",
+    Default = true,
+    Callback = function(v) RageSettings.HitNotify = v end
+})
+RagebotLeft:AddSlider("Speed", {
+    Text = "移动速度",
+    Min = 1,
+    Max = 24,
+    Default = 16,
+    Rounding = 0,
+    Callback = function(v)
+        RageSettings.Speed = v
+        local char = LocalPlayer.Character
+        if char then
+            local hum = char:FindFirstChildOfClass("Humanoid")
+            if hum then
+                hum.WalkSpeed = v
+            end
+        end
+    end
+})
+
+LocalPlayer.CharacterAdded:Connect(function(char)
+    local hum = char:WaitForChild("Humanoid")
+    hum.WalkSpeed = RageSettings.Speed
+end)
+if LocalPlayer.Character then
+    local hum = LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+    if hum then
+        hum.WalkSpeed = RageSettings.Speed
+    end
+end
+
+task.spawn(function()
+    while true do
+        task.wait(0.5)
+        if LocalPlayer.Character then
+            local hum = LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+            if hum and hum.WalkSpeed ~= RageSettings.Speed then
+                hum.WalkSpeed = RageSettings.Speed
+            end
+        end
+    end
+end)
 
 local EspLeft = Tabs.Esp:AddLeftGroupbox("玩家 ESP")
 local EspRight = Tabs.Esp:AddRightGroupbox("追踪线设置")
-
 EspLeft:AddToggle("ESP_Enabled", {
     Text = "启用 ESP",
     Default = false,
     Callback = function(v) getgenv().ESPSettings.Enabled = v; UpdateESP() end
 })
-EspLeft:AddToggle("ESP_Box", {
-    Text = "方框",
-    Default = true,
-    Callback = function(v) getgenv().ESPSettings.Box = v; UpdateESP() end
-})
-EspLeft:AddToggle("ESP_Name", {
-    Text = "名字",
-    Default = true,
-    Callback = function(v) getgenv().ESPSettings.Name = v; UpdateESP() end
-})
-EspLeft:AddToggle("ESP_HealthBar", {
-    Text = "血量条",
-    Default = true,
-    Callback = function(v) getgenv().ESPSettings.HealthBar = v; UpdateESP() end
-})
-EspLeft:AddToggle("ESP_Distance", {
-    Text = "距离",
-    Default = true,
-    Callback = function(v) getgenv().ESPSettings.Distance = v; UpdateESP() end
-})
-EspLeft:AddToggle("ESP_Tracer", {
-    Text = "追踪线",
-    Default = true,
-    Callback = function(v) getgenv().ESPSettings.Tracer = v; UpdateESP() end
-})
+EspLeft:AddToggle("ESP_Box", { Text = "方框", Default = true, Callback = function(v) getgenv().ESPSettings.Box = v; UpdateESP() end })
+EspLeft:AddToggle("ESP_Name", { Text = "名字", Default = true, Callback = function(v) getgenv().ESPSettings.Name = v; UpdateESP() end })
+EspLeft:AddToggle("ESP_HealthBar", { Text = "血量条", Default = true, Callback = function(v) getgenv().ESPSettings.HealthBar = v; UpdateESP() end })
+EspLeft:AddToggle("ESP_Distance", { Text = "距离", Default = true, Callback = function(v) getgenv().ESPSettings.Distance = v; UpdateESP() end })
+EspLeft:AddToggle("ESP_Tracer", { Text = "追踪线", Default = true, Callback = function(v) getgenv().ESPSettings.Tracer = v; UpdateESP() end })
 
 EspRight:AddLabel("颜色 (R/G/B)")
-EspRight:AddSlider("TracerR", {
-    Text = "红",
-    Min = 0, Max = 255, Default = 255, Rounding = 0,
-    Callback = function(v) getgenv().ESPSettings.TracerR = v; UpdateESP() end
-})
-EspRight:AddSlider("TracerG", {
-    Text = "绿",
-    Min = 0, Max = 255, Default = 255, Rounding = 0,
-    Callback = function(v) getgenv().ESPSettings.TracerG = v; UpdateESP() end
-})
-EspRight:AddSlider("TracerB", {
-    Text = "蓝",
-    Min = 0, Max = 255, Default = 255, Rounding = 0,
-    Callback = function(v) getgenv().ESPSettings.TracerB = v; UpdateESP() end
-})
-EspRight:AddSlider("TracerTransparency", {
-    Text = "透明度",
-    Min = 0, Max = 1, Default = 0.7, Rounding = 1,
-    Callback = function(v) getgenv().ESPSettings.Transparency = v; UpdateESP() end
-})
-EspRight:AddSlider("TracerThickness", {
-    Text = "线条粗细",
-    Min = 1, Max = 10, Default = 2, Rounding = 0,
-    Callback = function(v) getgenv().ESPSettings.Thickness = v; UpdateESP() end
-})
+EspRight:AddSlider("TracerR", { Text = "红", Min = 0, Max = 255, Default = 255, Rounding = 0, Callback = function(v) getgenv().ESPSettings.TracerR = v; UpdateESP() end })
+EspRight:AddSlider("TracerG", { Text = "绿", Min = 0, Max = 255, Default = 255, Rounding = 0, Callback = function(v) getgenv().ESPSettings.TracerG = v; UpdateESP() end })
+EspRight:AddSlider("TracerB", { Text = "蓝", Min = 0, Max = 255, Default = 255, Rounding = 0, Callback = function(v) getgenv().ESPSettings.TracerB = v; UpdateESP() end })
+EspRight:AddSlider("TracerTransparency", { Text = "透明度", Min = 0, Max = 1, Default = 0.7, Rounding = 1, Callback = function(v) getgenv().ESPSettings.Transparency = v; UpdateESP() end })
+EspRight:AddSlider("TracerThickness", { Text = "线条粗细", Min = 1, Max = 10, Default = 2, Rounding = 0, Callback = function(v) getgenv().ESPSettings.Thickness = v; UpdateESP() end })
 
 local MenuGroup = Tabs["UI Settings"]:AddLeftGroupbox("Debug")
-MenuGroup:AddToggle("KeybindMenuOpen", {
-    Default = Library.KeybindFrame.Visible,
-    Text = "快捷菜单",
-    Callback = function(v) Library.KeybindFrame.Visible = v end
-})
-MenuGroup:AddToggle("ShowCustomCursor", {
-    Text = "自定义光标",
-    Default = true,
-    Callback = function(v) Library.ShowCustomCursor = v end
-})
-MenuGroup:AddDropdown("NotificationSide", {
-    Values = {"Left","Right"},
-    Default = "Right",
-    Text = "通知位置",
-    Callback = function(v) Library:SetNotifySide(v) end
-})
-MenuGroup:AddDropdown("DPIDropdown", {
-    Values = {"25%","50%","75%","100%","125%","150%","175%","200%"},
-    Default = "100%",
-    Text = "UI 大小",
-    Callback = function(v)
-        v = v:gsub("%%","")
-        Library:SetDPIScale(tonumber(v))
-    end
-})
+MenuGroup:AddToggle("KeybindMenuOpen", { Default = Library.KeybindFrame.Visible, Text = "快捷菜单", Callback = function(v) Library.KeybindFrame.Visible = v end })
+MenuGroup:AddToggle("ShowCustomCursor", { Text = "自定义光标", Default = true, Callback = function(v) Library.ShowCustomCursor = v end })
+MenuGroup:AddDropdown("NotificationSide", { Values = {"Left","Right"}, Default = "Right", Text = "通知位置", Callback = function(v) Library:SetNotifySide(v) end })
+MenuGroup:AddDropdown("DPIDropdown", { Values = {"25%","50%","75%","100%","125%","150%","175%","200%"}, Default = "100%", Text = "UI 大小", Callback = function(v) v = v:gsub("%%",""); Library:SetDPIScale(tonumber(v)) end })
 MenuGroup:AddDivider()
-MenuGroup:AddLabel("菜单快捷键"):AddKeyPicker("MenuKeybind", {
-    Default = "RightShift",
-    NoUI = true,
-    Text = "菜单键位"
-})
+MenuGroup:AddLabel("菜单快捷键"):AddKeyPicker("MenuKeybind", { Default = "RightShift", NoUI = true, Text = "菜单键位" })
 MenuGroup:AddButton("销毁 UI", function() Library:Unload() end)
 
 ThemeManager:SetLibrary(Library)
@@ -554,5 +596,3 @@ SaveManager:SetSubFolder("specific-place")
 SaveManager:BuildConfigSection(Tabs["UI Settings"])
 ThemeManager:ApplyToTab(Tabs["UI Settings"])
 SaveManager:LoadAutoloadConfig()
-
-doReload()
